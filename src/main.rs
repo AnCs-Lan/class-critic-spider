@@ -1,80 +1,32 @@
+mod types;
+use crate::types::{LeanCloudResponse, Review};
 use chrono::{SecondsFormat, Utc};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
-use serde::Deserialize;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-#[derive(Deserialize, Default)]
-struct Ratings {
-    #[serde(rename = "rate1", default)]
-    professionalism: u8,
-    #[serde(rename = "rate2", default)]
-    expressive: u8,
-    #[serde(rename = "rate3", default)]
-    friendliness: u8,
-    #[serde(rename = "overall", default)]
-    total: u8,
-}
-
-#[derive(Deserialize, Default)]
-struct Review {
-    #[serde(rename = "objectId", default)]
-    review_id: String,
-    #[serde(rename = "profName", default)]
-    teacher_name: String,
-    #[serde(rename = "courseName", default)]
-    course_name: String,
-    #[serde(rename = "createdAt", default)]
-    create_date: String,
-    #[serde(rename = "upVote", default)]
-    up_vote: u32,
-    #[serde(rename = "downVote", default)]
-    down_vote: u32,
-    #[serde(rename = "comment", default)]
-    comment: String,
-    #[serde(rename = "rating", default)]
-    ratings: Ratings,
-}
-
-#[derive(Deserialize)]
-struct LeanCloudResponse {
-    #[serde(default)]
-    results: Vec<Review>,
-}
-
 fn get_client() -> reqwest::Client {
     let mut headers = HeaderMap::new();
+    let user_agent = std::env::var("USER_AGENT").expect("env文件中没有变量user_agent");
+    let content_type = std::env::var("CONTENT_TYPE").expect("env文件中没有变量CONTENT_TYPE");
+    let origin = std::env::var("Origin").expect("env文件中没有变量Origin");
+    let referer = std::env::var("Referer").expect("env文件中没有变量Referer");
+    let x_lc_id = std::env::var("X_LC_Id").expect("env文件中没有变量X_LC_Id");
+    let x_lc_session = std::env::var("X_LC_Session").expect("env文件中没有变量X_LC_Session");
+    let x_lc_ua = std::env::var("X_LC_UA").expect("env文件中没有变量X_LC_UA");
+    let x_lc_sign = std::env::var("X_LC_Sign").expect("env文件中没有变量X_LC_Sign");
+    headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
+    headers.insert(CONTENT_TYPE, HeaderValue::from_str(&content_type).unwrap());
+    headers.insert("Origin", HeaderValue::from_str(&origin).unwrap());
+    headers.insert("Referer", HeaderValue::from_str(&referer).unwrap());
+    headers.insert("X-LC-Id", HeaderValue::from_str(&x_lc_id).unwrap());
+    headers.insert("X-LC-UA", HeaderValue::from_str(&x_lc_ua).unwrap());
     headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static(
-            "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
-        ),
+        "X-LC-Session",
+        HeaderValue::from_str(&x_lc_session).unwrap(),
     );
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/json;charset=UTF-8"),
-    );
-    headers.insert(
-        "Origin",
-        HeaderValue::from_static("https://app.huoshui.org"),
-    );
-    headers.insert(
-        "Referer",
-        HeaderValue::from_static("https://app.huoshui.org/"),
-    );
-    headers.insert(
-        "X-LC-Id",
-        HeaderValue::from_static("zwjjm3MbxDYRKny9f31amkXq"),
-    );
-    headers.insert(
-        "X-LC-UA",
-        HeaderValue::from_static("LeanCloud-JS-SDK/4.14.0 (Browser)"),
-    );
-    headers.insert(
-        "X-LC-Sign",
-        HeaderValue::from_static("632cbdae5e35771de22b88b0a690366b,1781851480568"),
-    );
+    headers.insert("X-LC-Sign", HeaderValue::from_str(&x_lc_sign).unwrap());
     reqwest::Client::builder()
         .default_headers(headers)
         .build()
@@ -89,13 +41,34 @@ async fn database_worker(mut rx: mpsc::Receiver<Vec<Review>>, pool: sqlx::Sqlite
                 continue;
             }
 
+            let course_data = match item.course_data.clone() {
+                Some(data) => data,
+                None => {
+                    println!(
+                        "跳过了一条脏数据：评价 ID 为 {} 的记录缺失 courseId 字段",
+                        item.review_id
+                    );
+                    continue;
+                }
+            };
+
+            let author_data = match item.author_data.clone() {
+                Some(data) => data,
+                None => {
+                    println!("跳过脏数据: 评价 {} 缺失 authorId", item.review_id);
+                    continue;
+                }
+            };
+
             let teacher_row = sqlx::query!(
                 r#"
-                INSERT INTO teachers (name) VALUES (?)
-                ON CONFLICT(name) DO UPDATE SET name=name
+                INSERT INTO teacher (name, position, dept) VALUES (?, ?, ?)
+                ON CONFLICT(name, dept) DO UPDATE SET position=excluded.position
                 RETURNING id
                 "#,
-                &item.teacher_name
+                &item.teacher_name,
+                &course_data.position,
+                &course_data.dept
             )
             .fetch_one(&mut *tx)
             .await
@@ -104,32 +77,38 @@ async fn database_worker(mut rx: mpsc::Receiver<Vec<Review>>, pool: sqlx::Sqlite
 
             let course_row = sqlx::query!(
                 r#"
-                INSERT INTO courses (name) VALUES (?)
-                ON CONFLICT(name) DO UPDATE SET name=name
+                INSERT INTO course (origin_id,name) VALUES (?,?)
+                ON CONFLICT(origin_id) DO UPDATE SET name=excluded.name
                 RETURNING id
                 "#,
+                &course_data.object_id,
                 &item.course_name
             )
             .fetch_one(&mut *tx)
             .await
             .unwrap();
             let local_course_id: i64 = course_row.id;
+            let flat_tags = item.extract_all_tags();
+            let tags_json = serde_json::to_string(&flat_tags).unwrap_or_else(|_| "[]".to_string());
 
             sqlx::query!(
                 r#"
-                INSERT OR IGNORE INTO reviews(id, teacher_id, course_id, comment, rate_professinalism, rate_expressive, rate_friendliness, rate_total, up_vote, down_vote)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT OR IGNORE INTO review (id, teacher_id, course_id, user_name, comment, pro, exp, frd, total, up_vote, down_vote, tags, time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 "#,
                 &item.review_id,
                 local_teacher_id,
                 local_course_id,
+                &author_data.user_name,
                 &item.comment,
-                item.ratings.professionalism,
-                item.ratings.expressive,
-                item.ratings.friendliness,
-                item.ratings.total,
+                item.rating.pro,
+                item.rating.exp,
+                item.rating.frd,
+                item.rating.total,
                 item.up_vote,
                 item.down_vote,
+                tags_json,
+                &item.time
             )
             .execute(&mut *tx)
             .await
@@ -141,7 +120,7 @@ async fn database_worker(mut rx: mpsc::Receiver<Vec<Review>>, pool: sqlx::Sqlite
     }
 }
 
-async fn network_producer(tx: mpsc::Sender<Vec<Review>>) {
+async fn network_producer(tx: mpsc::Sender<Vec<Review>>, latest_time: Option<String>) {
     let client = get_client();
     let mut current_time = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     loop {
@@ -159,12 +138,20 @@ async fn network_producer(tx: mpsc::Sender<Vec<Review>>) {
             break;
         }
 
+        tx.send(reviews.clone()).await.unwrap();
+
         if let Some(last_one) = reviews.last() {
-            current_time = last_one.create_date.clone();
+            current_time = last_one.time.clone();
+            if let Some(db_time) = latest_time
+                .clone()
+                .filter(|t| current_time.as_str() < t.as_str())
+            {
+                println!("数据获取完成，截止时间{}", db_time);
+                break;
+            }
         }
 
-        tx.send(reviews).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
 }
 
@@ -179,41 +166,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS teachers (
+        CREATE TABLE IF NOT EXISTS teacher (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
+            name TEXT NOT NULL,
+            position TEXT,
+            dept TEXT,
+            UNIQUE(name,dept)
         );
 
-        CREATE TABLE IF NOT EXISTS courses (
+        CREATE TABLE IF NOT EXISTS course (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
+            origin_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL
         );
         
-        CREATE TABLE IF NOT EXISTS reviews (
+        CREATE TABLE IF NOT EXISTS review (
             id TEXT PRIMARY KEY,
             teacher_id INTEGER,
             course_id INTEGER,
+            user_name TEXT,
             comment TEXT NOT NULL,
-            rate_professinalism INTEGER,
-            rate_expressive INTEGER,
-            rate_friendliness INTEGER,
-            rate_total INTEGER,
-            up_vote INTEGER,
-            down_vote INTEGER,
-            FOREIGN KEY(teacher_id) REFERENCES teachers(id),
-            FOREIGN KEY(course_id) REFERENCES courses(id)
-        )
+            pro INTEGER,
+            exp INTEGER,
+            frd INTEGER,
+            total INTEGER,
+            up_vote INTEGER DEFAULT 1,
+            down_vote INTEGER DEFAULT 1,
+            tags TEXT,
+            time TEXT NOT NULL,
+            FOREIGN KEY(teacher_id) REFERENCES teacher(id),
+            FOREIGN KEY(course_id) REFERENCES course(id)
+        );
+
+        -- 联合查询优化
+        CREATE INDEX IF NOT EXISTS idx_review_teacher_course
+        ON review(teacher_id, course_id);
         "#,
     )
     .execute(&pool)
     .await?;
     println!("数据库检查完毕");
 
+    let latest_time: Option<String> =
+        sqlx::query_scalar("SELECT time FROM review ORDER BY time DESC LIMIT 1")
+            .fetch_optional(&pool)
+            .await?
+            .flatten();
+
     let (tx, rx) = mpsc::channel::<Vec<Review>>(100);
-    tokio::spawn(async move {
+    let worker_handel = tokio::spawn(async move {
         database_worker(rx, pool.clone()).await;
     });
-    network_producer(tx).await;
-
+    network_producer(tx, latest_time).await;
+    worker_handel.await?;
     Ok(())
 }
