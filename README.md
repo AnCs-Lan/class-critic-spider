@@ -15,7 +15,7 @@ cargo run --bin create_db
 
 ### 构建环境
 
-需要在项目根目录创建环境并填补字段：
+需要在项目根目录创建环境`.env`文件并填补字段：
 
 ```.env
 DATABASE_URL="sqlite:./reviews.db"
