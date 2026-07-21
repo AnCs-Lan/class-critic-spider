@@ -94,27 +94,31 @@ pub struct Review {
 impl Review {
     pub fn extract_all_tags(&self) -> Vec<String> {
         let mut all_tags = Vec::new();
-        //氛围tags
+        let is_valid_tag = |s: &str| -> bool {
+            let trimmed = s.trim();
+            !trimmed.is_empty() && trimmed != "未填" && trimmed != "未选择" && trimmed != "暂无"
+        };
+        // 氛围tags
         if let Some(ref custom_tags) = self.tags {
             for tag in custom_tags {
-                if tag.checked && !tag.value.trim().is_empty() {
-                    all_tags.push(tag.value.clone());
+                if tag.checked && is_valid_tag(&tag.value) {
+                    all_tags.push(tag.value.trim().to_string());
                 }
             }
         }
-        //点名
-        if let Some(ref att) = self.attendance {
-            all_tags.push(format!("点名情况:{}", att.name));
+        // 点名
+        if let Some(att) = self.attendance.as_ref().filter(|a| is_valid_tag(&a.name)) {
+            all_tags.push(format!("点名情况:{}", att.name.trim()));
         }
-        //水课鉴定
-        if let Some(ref b) = self.bird {
-            all_tags.push(b.name.clone());
+        // 水课鉴定
+        if let Some(b) = self.bird.as_ref().filter(|b| is_valid_tag(&b.name)) {
+            all_tags.push(b.name.trim().to_string());
         }
-        //作业量
-        if let Some(ref hw) = self.homework {
-            all_tags.push(format!("作业量:{}", hw.name));
+        // 作业量
+        if let Some(hw) = self.homework.as_ref().filter(|h| is_valid_tag(&h.name)) {
+            all_tags.push(format!("作业量:{}", hw.name.trim()));
         }
-        //考试
+        // 考试
         if let Some(ref ex) = self.exam {
             if let Some(true) = ex.openbook.as_ref().map(|item| item.checked) {
                 all_tags.push("开卷".to_string());
@@ -129,6 +133,7 @@ impl Review {
                 all_tags.push("给分比较宽松".to_string());
             }
         }
+
         all_tags
     }
 }
